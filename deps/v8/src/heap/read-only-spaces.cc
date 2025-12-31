@@ -8,13 +8,16 @@
 
 #include "include/v8-internal.h"
 #include "include/v8-platform.h"
+#include "src/base/build_config.h"
 #include "src/base/logging.h"
+#include "src/base/numerics/safe_conversions.h"
 #include "src/common/globals.h"
 #include "src/common/ptr-compr-inl.h"
 #include "src/execution/isolate.h"
 #include "src/heap/allocation-stats.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-verifier.h"
+#include "src/heap/heap.h"
 #include "src/heap/marking-state-inl.h"
 #include "src/heap/memory-allocator.h"
 #include "src/heap/memory-chunk-metadata.h"
@@ -146,10 +149,14 @@ ReadOnlyPageMetadata::ReadOnlyPageMetadata(Heap* heap, BaseSpace* space,
                           Executability::NOT_EXECUTABLE) {
   allocated_bytes_ = 0;
   set_never_evacuate();
+  set_is_read_only_page();
 }
 
 MemoryChunk::MainThreadFlags ReadOnlyPageMetadata::InitialFlags() const {
-  MemoryChunk::MainThreadFlags flags = MemoryChunk::READ_ONLY_HEAP;
+  MemoryChunk::MainThreadFlags flags = MemoryChunk::NO_FLAGS;
+#if !CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+  flags |= MemoryChunk::READ_ONLY_HEAP;
+#endif  // !CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
 #if V8_ENABLE_STICKY_MARK_BITS_BOOL
   if constexpr (v8_flags.sticky_mark_bits.value()) {
     flags |= MemoryChunk::STICKY_MARK_BIT_CONTAINS_ONLY_OLD;
@@ -248,16 +255,8 @@ class ReadOnlySpaceObjectIterator : public ObjectIterator {
       const int obj_size = obj->Size();
       cur_addr_ += ALIGN_TO_ALLOCATION_ALIGNMENT(obj_size);
       DCHECK_LE(cur_addr_, cur_end_);
-      if (IsAnyHole(obj) || !IsFreeSpaceOrFiller(obj)) {
-#ifdef V8_ENABLE_WEBASSEMBLY
-        // WasmNull is extra special because it also reserves (unmapped) padding
-        // for the hole roots.
-        if (IsAnyHole(obj) || !IsWasmNull(obj)) {
-          DCHECK_VALID_REGULAR_OBJECT_SIZE(obj_size);
-        }
-#else
+      if (!IsFreeSpaceOrFiller(obj)) {
         DCHECK_VALID_REGULAR_OBJECT_SIZE(obj_size);
-#endif  // V8_ENABLE_WEBASSEMBLY
         return obj;
       }
     }
@@ -318,7 +317,7 @@ void ReadOnlySpace::VerifyCounters(Heap* heap) const {
     size_t real_allocated = 0;
     for (Tagged<HeapObject> object = it.Next(); !object.is_null();
          object = it.Next()) {
-      if (IsAnyHole(object) || !IsFreeSpaceOrFiller(object)) {
+      if (!IsFreeSpaceOrFiller(object)) {
         real_allocated += object->Size();
       }
     }
@@ -372,15 +371,6 @@ void ReadOnlySpace::EnsurePage() {
                 heap_->isolate()->cage_base() == pages_.back()->ChunkAddress());
 }
 
-namespace {
-
-constexpr inline int ReadOnlyAreaSize() {
-  return static_cast<int>(
-      MemoryChunkLayout::AllocatableMemoryInMemoryChunk(RO_SPACE));
-}
-
-}  // namespace
-
 void ReadOnlySpace::EnsureSpaceForAllocation(int size_in_bytes) {
   if (top_ + size_in_bytes <= limit_) {
     return;
@@ -394,8 +384,6 @@ void ReadOnlySpace::EnsureSpaceForAllocation(int size_in_bytes) {
       heap()->memory_allocator()->AllocateReadOnlyPage(this);
   CHECK_NOT_NULL(metadata);
 
-  capacity_ += ReadOnlyAreaSize();
-
   accounting_stats_.IncreaseCapacity(metadata->area_size());
   AccountCommitted(metadata->size());
   pages_.push_back(metadata);
@@ -405,6 +393,58 @@ void ReadOnlySpace::EnsureSpaceForAllocation(int size_in_bytes) {
 
   top_ = metadata->area_start();
   limit_ = metadata->area_end();
+}
+
+AllocationResult ReadOnlySpace::AllocateRawUnmappableAllocation(
+    int mapped_prefix_in_bytes, int unmapped_payload_in_bytes) {
+#if V8_STATIC_ROOTS_BOOL || V8_STATIC_ROOTS_GENERATION_BOOL
+  constexpr size_t kLargestPossibleOSPageSize = 64 * KB;
+  static_assert(kLargestPossibleOSPageSize >= kMinimumOSPageSize);
+
+  // The unmapped payload should be a multiple of the largest possible OS page
+  // size, so that it can always be unmapped.
+  CHECK_EQ(unmapped_payload_in_bytes % kLargestPossibleOSPageSize, 0);
+
+  // The prefix + aligned unmapped payload (i.e. one OS page for the prefix and
+  // N pages for the payload) should fit in a single V8 page.
+  CHECK_LE(kLargestPossibleOSPageSize + unmapped_payload_in_bytes,
+           kRegularPageSize);
+
+  // Check if we can align the unmapped payload to kLargestPossibleOSPageSize
+  // without falling off the end of the page.
+  Address rounded_top =
+      RoundUp(top_ + mapped_prefix_in_bytes, kLargestPossibleOSPageSize);
+
+  // If we cannot, then ensure space on a new page for the allocation.
+  if (rounded_top + unmapped_payload_in_bytes > limit_) {
+    EnsureSpaceForAllocation(kLargestPossibleOSPageSize +
+                             unmapped_payload_in_bytes);
+    rounded_top =
+        RoundUp(top_ + mapped_prefix_in_bytes, kLargestPossibleOSPageSize);
+  }
+
+  // Now add padding up to the mapped prefix.
+  Address allocation_start = rounded_top - mapped_prefix_in_bytes;
+  int filler_size = base::checked_cast<int>(allocation_start - top_);
+  Address filler_address = AllocateRawUnaligned(filler_size).ToAddress();
+  heap()->CreateFillerObjectAt(filler_address, filler_size,
+                               ClearFreedMemoryMode::kClearFreedMemory);
+
+  CHECK_EQ(allocation_start, top_);
+  CHECK_LE(
+      allocation_start + mapped_prefix_in_bytes + unmapped_payload_in_bytes,
+      limit_);
+
+  // Finally allocate and return the requested size.
+  AllocationResult result =
+      AllocateRawUnaligned(mapped_prefix_in_bytes + unmapped_payload_in_bytes);
+  CHECK_EQ((result.ToAddress() + mapped_prefix_in_bytes) %
+               kLargestPossibleOSPageSize,
+           0);
+  return result;
+#else
+  UNREACHABLE();
+#endif
 }
 
 Tagged<HeapObject> ReadOnlySpace::TryAllocateLinearlyAligned(
@@ -519,7 +559,6 @@ void ReadOnlySpace::ShrinkPages() {
   for (ReadOnlyPageMetadata* page : pages_) {
     DCHECK(page->never_evacuate());
     size_t unused = page->ShrinkToHighWaterMark();
-    capacity_ -= unused;
     accounting_stats_.DecreaseCapacity(static_cast<intptr_t>(unused));
     AccountUncommitted(unused);
   }
@@ -543,7 +582,6 @@ size_t ReadOnlySpace::IndexOf(const MemoryChunkMetadata* chunk) const {
 size_t ReadOnlySpace::AllocateNextPage() {
   ReadOnlyPageMetadata* page =
       heap_->memory_allocator()->AllocateReadOnlyPage(this);
-  capacity_ += ReadOnlyAreaSize();
   AccountCommitted(page->size());
   pages_.push_back(page);
   return pages_.size() - 1;
@@ -560,7 +598,6 @@ size_t ReadOnlySpace::AllocateNextPageAt(Address pos) {
   // the shared cage before us, stealing our required page (i.e.,
   // ReadOnlyHeap::SetUp was called too late).
   CHECK_EQ(pos, page->ChunkAddress());
-  capacity_ += ReadOnlyAreaSize();
   AccountCommitted(page->size());
   pages_.push_back(page);
   return pages_.size() - 1;

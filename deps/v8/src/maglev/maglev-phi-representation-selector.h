@@ -12,6 +12,7 @@
 #include "src/compiler/turboshaft/snapshot-table.h"
 #include "src/maglev/maglev-compilation-info.h"
 #include "src/maglev/maglev-graph-processor.h"
+#include "src/maglev/maglev-ir.h"
 #include "src/maglev/maglev-reducer.h"
 
 namespace v8 {
@@ -31,9 +32,10 @@ constexpr bool IsUntagging(Opcode op) {
     case Opcode::kTruncateUnsafeNumberOrOddballToInt32:
     case Opcode::kCheckedNumberOrOddballToFloat64:
     case Opcode::kCheckedNumberToFloat64:
-    case Opcode::kUncheckedNumberOrOddballToFloat64:
-    case Opcode::kUncheckedNumberToFloat64:
+    case Opcode::kUnsafeNumberOrOddballToFloat64:
+    case Opcode::kUnsafeNumberToFloat64:
     case Opcode::kCheckedNumberOrOddballToHoleyFloat64:
+    case Opcode::kCheckedNumberToShiftedInt53:
       return true;
     default:
       return false;
@@ -108,6 +110,19 @@ class MaglevPhiRepresentationSelector {
   // updates {phi}'s representation to {repr}.
   void ConvertTaggedPhiTo(Phi* phi, ValueRepresentation repr,
                           const HoistTypeList& hoist_untagging);
+  void UntagInputWithHoistedUntagging(Phi* phi, ValueRepresentation repr,
+                                      int input_index, ValueNode* input,
+                                      HoistType hoist_type);
+  void UntagSmiConstantInput(Phi* phi, ValueRepresentation repr,
+                             int input_index, const SmiConstant* input);
+  void UntagConstantInput(Phi* phi, ValueRepresentation repr, int input_index,
+                          const Constant* input);
+  void UntagConversionInput(Phi* phi, ValueRepresentation repr, int input_index,
+                            ValueNode* input);
+  void UntagPhiInput(Phi* phi, ValueRepresentation repr, int input_index,
+                     Phi* input_phi);
+  void UntagLoadTaggedFieldInput(Phi* phi, ValueRepresentation repr,
+                                 int input_index, LoadTaggedField* load);
   template <class NodeT>
   ValueNode* GetReplacementForPhiInputConversion(ValueNode* input, Phi* phi,
                                                  uint32_t input_index);
@@ -166,6 +181,9 @@ class MaglevPhiRepresentationSelector {
     return ProcessResult::kContinue;
   }
 
+  ProcessResult UpdateNodePhiInput(NumberToString* node, Phi* phi,
+                                   int input_index,
+                                   const ProcessingState* state);
   ProcessResult UpdateNodePhiInput(CheckSmi* node, Phi* phi, int input_index,
                                    const ProcessingState* state);
   ProcessResult UpdateNodePhiInput(CheckNumber* node, Phi* phi, int input_index,

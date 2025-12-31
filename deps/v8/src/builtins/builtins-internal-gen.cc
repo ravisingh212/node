@@ -1297,9 +1297,12 @@ void CppBuiltinsAdaptorAssembler::GenerateAdaptor(int formal_parameter_count) {
 
   // Update arguments count for CEntry to contain the number of arguments
   // including the receiver and the extra arguments.
+  // Use UniqueInt32Constant instead of Int32Constant here in order to ensure
+  // that the graph structure does not depend on the actual kNumExtraArgs value
+  // (Int32Constant uses cached nodes).
   TNode<Int32T> argc =
       Int32Add(pushed_argc.value(),
-               Int32Constant(BuiltinExitFrameConstants::kNumExtraArgs));
+               UniqueInt32Constant(BuiltinExitFrameConstants::kNumExtraArgs));
 
   const bool builtin_exit_frame = true;
   const bool switch_to_central_stack = false;
@@ -1309,16 +1312,17 @@ void CppBuiltinsAdaptorAssembler::GenerateAdaptor(int formal_parameter_count) {
   static_assert(BuiltinArguments::kNewTargetIndex == 0);
   static_assert(BuiltinArguments::kTargetIndex == 1);
   static_assert(BuiltinArguments::kArgcIndex == 2);
-  static_assert(BuiltinArguments::kPaddingIndex == 3);
+  // Code generator will take care of pushing padding on arm64.
+  static_assert(BuiltinArguments::kOptionalPaddingIndex == 3);
 
   // Unconditionally push argc, target and new target as extra stack arguments.
   // They will be used by stack frame iterators when constructing stack trace.
-  TailCallBuiltin(centry, context,     // standard arguments for TailCallBuiltin
-                  argc, c_function,    // register arguments
-                  TheHoleConstant(),   // additional stack argument 1 (padding)
-                  SmiFromInt32(argc),  // additional stack argument 2
-                  target,              // additional stack argument 3
-                  new_target);         // additional stack argument 4
+  TailCallBuiltin(centry, context,   // standard arguments for TailCallBuiltin
+                  argc, c_function,  // register arguments
+                  // additional stack arguments
+                  new_target,           // sp[0]
+                  target,               // sp[1]
+                  SmiFromInt32(argc));  // sp[2]
 }
 
 TF_BUILTIN(AdaptorWithBuiltinExitFrame0, CppBuiltinsAdaptorAssembler) {
@@ -1435,18 +1439,6 @@ void Builtins::Generate_WasmCEntry(MacroAssembler* masm) {
   Generate_CEntry(masm, 1, ArgvMode::kStack, false, true);
 }
 
-#if !defined(V8_TARGET_ARCH_ARM)
-void Builtins::Generate_MemCopyUint8Uint8(MacroAssembler* masm) {
-  masm->CallBuiltin(Builtin::kIllegal);
-}
-#endif  // !defined(V8_TARGET_ARCH_ARM)
-
-#ifndef V8_TARGET_ARCH_IA32
-void Builtins::Generate_MemMove(MacroAssembler* masm) {
-  masm->CallBuiltin(Builtin::kIllegal);
-}
-#endif  // V8_TARGET_ARCH_IA32
-
 void Builtins::Generate_BaselineLeaveFrame(MacroAssembler* masm) {
 #ifdef V8_ENABLE_SPARKPLUG
   EmitReturnBaseline(masm);
@@ -1455,23 +1447,10 @@ void Builtins::Generate_BaselineLeaveFrame(MacroAssembler* masm) {
 #endif  // V8_ENABLE_SPARKPLUG
 }
 
-#if defined(V8_ENABLE_MAGLEV) && !defined(V8_ENABLE_LEAPTIERING)
-void Builtins::Generate_MaglevOptimizeCodeOrTailCallOptimizedCodeSlot(
-    MacroAssembler* masm) {
-  using D = MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor;
-  Register flags = D::GetRegisterParameter(D::kFlags);
-  Register feedback_vector = D::GetRegisterParameter(D::kFeedbackVector);
-  Register temporary = D::GetRegisterParameter(D::kTemporary);
-  masm->AssertFeedbackVector(feedback_vector, temporary);
-  masm->OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
-  masm->Trap();
-}
-#else
 void Builtins::Generate_MaglevOptimizeCodeOrTailCallOptimizedCodeSlot(
     MacroAssembler* masm) {
   masm->Trap();
 }
-#endif  // V8_ENABLE_MAGLEV && !V8_ENABLE_LEAPTIERING
 
 #ifndef V8_ENABLE_MAGLEV
 // static
@@ -1515,6 +1494,7 @@ TF_BUILTIN(GetProperty, CodeStubAssembler) {
                           &var_value, next_holder, if_bailout,
                           kExpectingJSReceiver);
         BIND(&if_found);
+        GotoIfLazyClosure(CAST(var_value.value()), if_bailout);
         Return(var_value.value());
       };
 
@@ -1654,11 +1634,9 @@ TF_BUILTIN(InstantiateAsmJs, JSTrampolineAssembler) {
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
   auto dispatch_handle =
       UncheckedParameter<JSDispatchHandleT>(Descriptor::kDispatchHandle);
-#elif defined(V8_ENABLE_LEAPTIERING)
+#else
   TNode<JSDispatchHandleT> dispatch_handle = ReinterpretCast<JSDispatchHandleT>(
       LoadJSFunctionDispatchHandle(function));
-#else
-  auto dispatch_handle = InvalidDispatchHandleConstant();
 #endif
 
   // This builtin is used on functions with different parameter counts.
@@ -1681,6 +1659,12 @@ TF_BUILTIN(InstantiateAsmJs, JSTrampolineAssembler) {
   BIND(&tailcall_to_function);
   // On failure, tail call back to regular JavaScript by re-calling the given
   // function which has been reset to the compile lazy builtin.
+  // Make sure that the dispatch table entry is still intact; calling out to JS
+  // might have free'd and re-allocated it (https://crbug.com/462217236).
+  CSA_SBXCHECK(
+      this,
+      Word32Equal(DynamicJSParameterCount(),
+                  LoadParameterCountFromJSDispatchTable(dispatch_handle)));
   TailCallJSFunction(function);
 }
 

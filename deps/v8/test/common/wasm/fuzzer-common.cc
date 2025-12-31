@@ -182,12 +182,12 @@ bool ValuesEquivalent(const WasmValue& init_lhs, const WasmValue& init_rhs,
       if (!IsString(rhs_ref)) return false;
       if (!Cast<String>(lhs_ref)->Equals(Cast<String>(rhs_ref))) return false;
     } else {
-      PrintF(
-          "WARNING: equivalence checking for instance type %d is not "
-          "implemented, results may be unreliable\n",
+      i::StdoutStream{} << "Equivalence checking not implemented for: "
+                        << Brief(lhs_ref) << "\n";
+      FATAL(
+          "Equivalence checking for instance type %d is not implemented "
+          "(find printed object in output above)\n",
           Cast<HeapObject>(lhs_ref)->map()->instance_type());
-      // TODO(nikolaskaipel): Consider putting `UNIMPLEMENTED()` or
-      // `return false` here.
     }
   }
 
@@ -498,8 +498,7 @@ ExecutionResult ExecuteReferenceRun(Isolate* isolate,
                                     int exported_main_function_index,
                                     int32_t max_executed_instructions) {
   // The reference module uses a special compilation mode of Liftoff for
-  // termination and nondeterminism detected, and that would be undone by
-  // flushing that code.
+  // termination detection, and that would be undone by flushing that code.
   FlagScope<bool> no_liftoff_code_flushing(&v8_flags.flush_liftoff_code, false);
 
   int32_t max_steps = max_executed_instructions;
@@ -815,26 +814,38 @@ bool TablesMatch(Isolate* isolate, const WasmModule* module,
     Tagged<FixedArray> ref_table_entries = ref_table->entries();
 
     for (int j = 0; j < length; ++j) {
+      // TODO(clemensb): Avoid handle allocation.
       DirectHandle<Object> entry(table_entries->get(j), isolate);
       DirectHandle<Object> ref_entry(ref_table_entries->get(j), isolate);
 
+      // TODO(clemensb): Avoid putting Tuple2 in WasmValue.
       WasmValue value = WasmValue(entry, table->canonical_type(module));
       WasmValue ref_value =
           WasmValue(ref_entry, ref_table->canonical_type(module));
 
-      if (!ValuesEquivalent(value, ref_value, isolate)) {
-        table_mismatches++;
-
-        if (print_difference) {
-          std::ostringstream ss;
-          ss << "Error: Table entries at index " << j << " of table " << i
-             << " have different values!\n";
-          ss << "  - Reference: ";
-          PrintValue(ss, ref_value);
-          ss << "\n  - Actual:    ";
-          PrintValue(ss, value);
-          base::OS::PrintError("%s\n", ss.str().c_str());
+      // Tuple2 is used as placeholder in tables (see
+      // `WasmTableObject::SetFunctionTablePlaceholder`). They reference the
+      // instance and the function index; just check the stored function index.
+      if (IsTuple2(*entry)) {
+        if (IsTuple2(*ref_entry) && Cast<Tuple2>(*entry)->value2() ==
+                                        Cast<Tuple2>(*ref_entry)->value2()) {
+          continue;
         }
+      } else {
+        if (ValuesEquivalent(value, ref_value, isolate)) continue;
+      }
+
+      table_mismatches++;
+
+      if (print_difference) {
+        std::ostringstream ss;
+        ss << "Error: Table entries at index " << j << " of table " << i
+           << " have different values!\n";
+        ss << "  - Reference: ";
+        PrintValue(ss, ref_value);
+        ss << "\n  - Actual:    ";
+        PrintValue(ss, value);
+        base::OS::PrintError("%s\n", ss.str().c_str());
       }
     }
   }
@@ -1146,6 +1157,11 @@ void EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
       v8_flags.experimental_wasm_revectorize = true;
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
 
+#if V8_TARGET_ARCH_ARM64
+      // Fuzz the Wasm SIMD optimizations in Turboshaft for aarch64.
+      v8_flags.experimental_wasm_simd_opt = true;
+#endif  // V8_TARGET_ARCH_ARM64
+
       // Enforce implications from enabling features.
       FlagList::EnforceFlagImplications();
 
@@ -1285,9 +1301,6 @@ int SyncCompileAndExecuteAgainstReference(
   // around inlining). We switch it to synchronous mode to avoid the
   // nondeterminism of background jobs finishing at random times.
   FlagScope<bool> sync_tier_up(&v8_flags.wasm_sync_tier_up, true);
-  // Reference runs use extra compile settings (like non-determinism detection),
-  // which could be replaced by new liftoff code without this option.
-  FlagScope<bool> no_liftoff_code_flushing(&v8_flags.flush_liftoff_code, false);
 
   ErrorThrower thrower(i_isolate, "WasmFuzzerSyncCompile");
   MaybeDirectHandle<WasmModuleObject> compiled_module =

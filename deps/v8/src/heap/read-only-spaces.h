@@ -16,6 +16,7 @@
 #include "src/heap/allocation-stats.h"
 #include "src/heap/base-space.h"
 #include "src/heap/heap-verifier.h"
+#include "src/heap/heap.h"
 #include "src/heap/memory-chunk-layout.h"
 #include "src/heap/memory-chunk-metadata.h"
 
@@ -193,7 +194,7 @@ class ReadOnlySpace : public BaseSpace {
   const std::vector<ReadOnlyPageMetadata*>& pages() const { return pages_; }
   Address top() const { return top_; }
   Address limit() const { return limit_; }
-  size_t Capacity() const { return capacity_; }
+  size_t Capacity() const { return accounting_stats_.Capacity(); }
 
   // Returns the index within pages_. The chunk must be part of this space.
   size_t IndexOf(const MemoryChunkMetadata* chunk) const;
@@ -244,7 +245,8 @@ class ReadOnlySpace : public BaseSpace {
   void EnsureSpaceForAllocation(int size_in_bytes);
   void FreeLinearAllocationArea();
 
-  size_t capacity_ = 0;
+  AllocationResult AllocateRawUnmappableAllocation(
+      int mapped_prefix_in_bytes, int unmapped_payload_in_bytes);
 
   friend class Heap;
   friend class ReadOnlyHeapImageDeserializer;
